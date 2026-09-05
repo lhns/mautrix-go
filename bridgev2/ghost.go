@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/tidwall/sjson"
@@ -331,6 +332,48 @@ func (ghost *Ghost) updateDMPortals(ctx context.Context) {
 	}
 }
 
+// reapplyNicknames re-sends the member events of rooms where this ghost has a per-room
+// nickname.
+//
+// Setting the global profile makes the homeserver rewrite the ghost's member event in every
+// joined room, which overwrites the nickname. Synapse does that inside the set_displayname
+// handler, so re-sending once the profile call has returned lands after it. That is an
+// assumption about the homeserver rather than a spec guarantee; if it loses the race, the next
+// member sync sets the name again.
+func (ghost *Ghost) reapplyNicknames(ctx context.Context) {
+	members, err := ghost.Bridge.DB.PortalMember.GetAllForGhost(ctx, ghost.ID)
+	if err != nil {
+		zerolog.Ctx(ctx).Err(err).Msg("Failed to get portal members to reapply nicknames")
+		return
+	} else if len(members) == 0 {
+		return
+	}
+	log := zerolog.Ctx(ctx)
+	for _, member := range members {
+		portal, err := ghost.Bridge.GetExistingPortalByKey(ctx, member.Portal)
+		if err != nil {
+			log.Err(err).Object("portal_key", member.Portal).Msg("Failed to get portal to reapply nickname")
+			continue
+		} else if portal == nil || portal.MXID == "" {
+			continue
+		}
+		go ghost.reapplyNickname(log.WithContext(portal.backgroundCtx), portal, member.Nickname)
+	}
+}
+
+func (ghost *Ghost) reapplyNickname(ctx context.Context, portal *Portal, nickname string) {
+	_, err := ghost.Intent.SendState(ctx, portal.MXID, event.StateMember, ghost.Intent.GetMXID().String(), &event.Content{
+		Parsed: &event.MemberEventContent{
+			Membership:  event.MembershipJoin,
+			Displayname: nickname,
+			AvatarURL:   ghost.AvatarMXC,
+		},
+	}, time.Time{})
+	if err != nil {
+		zerolog.Ctx(ctx).Err(err).Msg("Failed to reapply member nickname after profile change")
+	}
+}
+
 func (ghost *Ghost) UpdateInfo(ctx context.Context, info *UserInfo) {
 	oldName := ghost.Name
 	oldAvatar := ghost.AvatarMXC
@@ -359,6 +402,9 @@ func (ghost *Ghost) UpdateInfo(ctx context.Context, info *UserInfo) {
 	ghost.pushProfileChanges(ctx, nameChanged, avatarMXCChanged, contactInfoChanged)
 	if oldName != ghost.Name || oldAvatar != ghost.AvatarMXC {
 		ghost.updateDMPortals(ctx)
+		// Both name and avatar, because the homeserver rewrites the whole member profile on
+		// either, and the nickname goes with it.
+		ghost.reapplyNicknames(ctx)
 	}
 	if update {
 		err := ghost.Bridge.DB.Ghost.Update(ctx, ghost.Ghost)

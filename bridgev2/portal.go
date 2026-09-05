@@ -4143,7 +4143,10 @@ type PortalInfo = ChatInfo
 type ChatMember struct {
 	EventSender
 	Membership event.Membership
-	// Per-room nickname for the user. Not yet used.
+	// Per-room nickname for the ghost, set as the displayname in the room's member event.
+	// Stored in portal_member so it can be re-applied after a global profile change, which
+	// the homeserver propagates into every room's member event. Only the login that owns the
+	// portal's names is allowed to set it; see pickNicknameOwner.
 	Nickname *string
 	// The power level to set for the user when syncing power levels.
 	PowerLevel *int
@@ -4159,6 +4162,35 @@ type ChatMember struct {
 }
 
 type ChatMemberMap map[networkid.UserID]ChatMember
+
+// memberDisplayname returns the displayname the room's member event should carry: the
+// per-room nickname when there is one, otherwise whatever the room already has.
+func memberDisplayname(current *event.MemberEventContent, nickname string, hasNickname bool) string {
+	if hasNickname {
+		return nickname
+	}
+	if current == nil {
+		return ""
+	}
+	return current.Displayname
+}
+
+// pickNicknameOwner returns the login whose nicknames a portal takes. A portal with a
+// Receiver belongs to that login. A shared portal has no natural owner, so take the lowest
+// login ID: arbitrary, but stable, which is what stops two logins overwriting each other's
+// nicknames on every resync.
+func pickNicknameOwner(receiver networkid.UserLoginID, logins []networkid.UserLoginID) networkid.UserLoginID {
+	if receiver != "" {
+		return receiver
+	}
+	var owner networkid.UserLoginID
+	for _, login := range logins {
+		if owner == "" || login < owner {
+			owner = login
+		}
+	}
+	return owner
+}
 
 // Set adds the given entry to this map, overwriting any existing entry with the same Sender field.
 func (cmm ChatMemberMap) Set(member ChatMember) ChatMemberMap {
@@ -4726,6 +4758,78 @@ func (portal *Portal) roomIsPublic(ctx context.Context) bool {
 	return looksDirectlyJoinable(content)
 }
 
+// resolveNicknames returns the per-room nicknames to apply in this sync, keyed by ghost MXID.
+//
+// It returns nil -- meaning the member events keep whatever displayname they have -- unless the
+// connector supplied at least one nickname AND this login owns the portal's names. A bridge that
+// never sets ChatMember.Nickname therefore runs no extra queries and produces no extra events.
+//
+// Supplied nicknames are persisted here rather than after the send: the row records what the
+// name should be, not confirmation that it was set, and a failed send is retried by the next sync.
+func (portal *Portal) resolveNicknames(ctx context.Context, members *ChatMemberList, source *UserLogin) map[id.UserID]string {
+	supplied := false
+	for _, member := range members.MemberMap {
+		if member.Nickname != nil && member.Sender != "" {
+			supplied = true
+			break
+		}
+	}
+	if !supplied || source == nil {
+		return nil
+	}
+	log := zerolog.Ctx(ctx)
+	owner := portal.Receiver
+	if owner == "" {
+		logins, err := portal.Bridge.GetUserLoginsInPortal(ctx, portal.PortalKey)
+		if err != nil {
+			log.Err(err).Msg("Failed to get user logins in portal to pick nickname owner")
+			return nil
+		}
+		ids := make([]networkid.UserLoginID, len(logins))
+		for i, login := range logins {
+			ids[i] = login.ID
+		}
+		owner = pickNicknameOwner("", ids)
+	}
+	if owner != source.ID {
+		log.Trace().
+			Str("nickname_owner", string(owner)).
+			Str("source_login", string(source.ID)).
+			Msg("Ignoring member nicknames from a login that does not own the portal's names")
+		return nil
+	}
+	stored, err := portal.Bridge.DB.PortalMember.GetAllInPortal(ctx, portal.PortalKey)
+	if err != nil {
+		log.Err(err).Msg("Failed to get stored member nicknames")
+		return nil
+	}
+	nicknames := make(map[id.UserID]string, len(stored))
+	for _, pm := range stored {
+		nicknames[portal.Bridge.Matrix.FormatGhostMXID(pm.GhostID)] = pm.Nickname
+	}
+	for _, member := range members.MemberMap {
+		if member.Nickname == nil || member.Sender == "" {
+			continue
+		}
+		mxid := portal.Bridge.Matrix.FormatGhostMXID(member.Sender)
+		if *member.Nickname == "" {
+			delete(nicknames, mxid)
+			err = portal.Bridge.DB.PortalMember.Delete(ctx, portal.PortalKey, member.Sender)
+		} else {
+			nicknames[mxid] = *member.Nickname
+			err = portal.Bridge.DB.PortalMember.Put(ctx, &database.PortalMember{
+				Portal:   portal.PortalKey,
+				GhostID:  member.Sender,
+				Nickname: *member.Nickname,
+			})
+		}
+		if err != nil {
+			log.Err(err).Str("ghost_id", string(member.Sender)).Msg("Failed to save member nickname")
+		}
+	}
+	return nicknames
+}
+
 func (portal *Portal) syncParticipants(
 	ctx context.Context,
 	members *ChatMemberList,
@@ -4745,6 +4849,7 @@ func (portal *Portal) syncParticipants(
 	if sender == nil {
 		sender = portal.Bridge.Bot
 	}
+	nicknames := portal.resolveNicknames(ctx, members, source)
 	log := zerolog.Ctx(ctx)
 	currentPower, err := portal.Bridge.Matrix.GetPowerLevels(ctx, portal.MXID)
 	if err != nil {
@@ -4771,7 +4876,11 @@ func (portal *Portal) syncParticipants(
 		}
 		currentMember, ok := currentMembers[extraUserID]
 		delete(currentMembers, extraUserID)
-		if ok && currentMember.Membership == member.Membership {
+		nickname, hasNickname := nicknames[extraUserID]
+		// The displayname has to be part of this comparison: a nickname change on its own
+		// leaves membership untouched, so without it the change would never be sent.
+		if ok && currentMember.Membership == member.Membership &&
+			currentMember.Displayname == memberDisplayname(currentMember, nickname, hasNickname) {
 			return false
 		}
 		if currentMember == nil {
@@ -4788,7 +4897,7 @@ func (portal *Portal) syncParticipants(
 		}
 		content := &event.MemberEventContent{
 			Membership:  member.Membership,
-			Displayname: currentMember.Displayname,
+			Displayname: memberDisplayname(currentMember, nickname, hasNickname),
 			AvatarURL:   currentMember.AvatarURL,
 		}
 		wrappedContent := &event.Content{Parsed: content, Raw: exmaps.NonNilClone(member.MemberEventExtra)}

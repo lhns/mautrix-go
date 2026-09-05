@@ -26,6 +26,7 @@ type Database struct {
 	User                *UserQuery
 	UserLogin           *UserLoginQuery
 	UserPortal          *UserPortalQuery
+	PortalMember        *PortalMemberQuery
 	BackfillTask        *BackfillTaskQuery
 	KV                  *KVQuery
 	PublicMedia         *PublicMediaQuery
@@ -124,6 +125,12 @@ func New(bridgeID networkid.BridgeID, mt MetaTypes, db *dbutil.Database) *Databa
 			BridgeID: bridgeID,
 			QueryHelper: dbutil.MakeQueryHelper(db, func(_ *dbutil.QueryHelper[*UserPortal]) *UserPortal {
 				return &UserPortal{}
+			}),
+		},
+		PortalMember: &PortalMemberQuery{
+			BridgeID: bridgeID,
+			QueryHelper: dbutil.MakeQueryHelper(db, func(_ *dbutil.QueryHelper[*PortalMember]) *PortalMember {
+				return &PortalMember{}
 			}),
 		},
 		BackfillTask: &BackfillTaskQuery{
