@@ -4143,7 +4143,9 @@ type PortalInfo = ChatInfo
 type ChatMember struct {
 	EventSender
 	Membership event.Membership
-	// Per-room nickname for the user. Not yet used.
+	// Per-room nickname for the user, set as the displayname in the room's member event.
+	// A later change to the ghost's global profile overrides it in every room until the
+	// next member sync re-applies it.
 	Nickname *string
 	// The power level to set for the user when syncing power levels.
 	PowerLevel *int
@@ -4159,6 +4161,18 @@ type ChatMember struct {
 }
 
 type ChatMemberMap map[networkid.UserID]ChatMember
+
+// memberDisplayname returns the displayname the room's member event should carry: the
+// connector's per-room nickname if it set one, otherwise whatever the room already has.
+func memberDisplayname(current *event.MemberEventContent, member ChatMember) string {
+	if member.Nickname != nil {
+		return *member.Nickname
+	}
+	if current == nil {
+		return ""
+	}
+	return current.Displayname
+}
 
 // Set adds the given entry to this map, overwriting any existing entry with the same Sender field.
 func (cmm ChatMemberMap) Set(member ChatMember) ChatMemberMap {
@@ -4771,7 +4785,8 @@ func (portal *Portal) syncParticipants(
 		}
 		currentMember, ok := currentMembers[extraUserID]
 		delete(currentMembers, extraUserID)
-		if ok && currentMember.Membership == member.Membership {
+		if ok && currentMember.Membership == member.Membership &&
+			currentMember.Displayname == memberDisplayname(currentMember, member) {
 			return false
 		}
 		if currentMember == nil {
@@ -4788,7 +4803,7 @@ func (portal *Portal) syncParticipants(
 		}
 		content := &event.MemberEventContent{
 			Membership:  member.Membership,
-			Displayname: currentMember.Displayname,
+			Displayname: memberDisplayname(currentMember, member),
 			AvatarURL:   currentMember.AvatarURL,
 		}
 		wrappedContent := &event.Content{Parsed: content, Raw: exmaps.NonNilClone(member.MemberEventExtra)}
