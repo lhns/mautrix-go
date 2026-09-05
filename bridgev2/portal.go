@@ -5102,7 +5102,13 @@ func (portal *Portal) updateParent(ctx context.Context, newParentID networkid.Po
 func (portal *Portal) lockedUpdateInfoFromGhost(ctx context.Context, ghost *Ghost) {
 	portal.roomCreateLock.Lock()
 	defer portal.roomCreateLock.Unlock()
-	portal.UpdateInfoFromGhost(ctx, ghost)
+	if portal.UpdateInfoFromGhost(ctx, ghost) {
+		portal.UpdateBridgeInfo(ctx)
+		err := portal.Save(ctx)
+		if err != nil {
+			zerolog.Ctx(ctx).Err(err).Msg("Failed to save portal to database after updating info from ghost")
+		}
+	}
 }
 
 func (portal *Portal) UpdateInfoFromGhost(ctx context.Context, ghost *Ghost) (changed bool) {
